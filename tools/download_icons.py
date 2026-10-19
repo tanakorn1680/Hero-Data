@@ -96,10 +96,7 @@ def main():
     for slug in slugs:
         dest = icons_dir / f'{slug}.jpg'
 
-        # ถ้ามีแล้วและขนาดสมเหตุสมผล → skip
-        if dest.exists() and dest.stat().st_size > 5000:
-            skip += 1
-            continue
+        # ไม่ skip — โหลดใหม่ทุกครั้งเพื่อให้ได้รูปถูกต้อง
 
         # อ่าน HTML ที่มีอยู่
         html_file = html_dir / f'{slug}.html'

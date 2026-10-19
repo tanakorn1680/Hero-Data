@@ -1,97 +1,146 @@
 #!/usr/bin/env python3
 """
-download_icons.py — ดาวน์โหลด icon ทุก hero จาก rovmeta HTML แล้วบันทึกเป็น <heroId>.jpg
-ใช้ใน GitHub Action ก่อน parse_heroes.py
+download_icons.py — ดาวน์โหลด icon ของแต่ละ hero จาก rovmeta.com โดยตรง
+- ดึง portrait URL จาก alt="[ชื่อภาษาไทย] portrait" ในหน้าของ hero นั้น
+- ถ้าไม่มี portrait ให้ fetch หน้านั้นใหม่จาก rovmeta แล้วดึง og:image หรือ structured data
+- บันทึกเป็น out/icons/<heroId>.jpg
 """
-import json, os, re, time, requests
+import json, re, time, random, gzip
 from pathlib import Path
-from html.parser import HTMLParser
+from urllib import request, error
 
+UA = "RoVGuideApp-IconFetch/1.0 (personal hobby project)"
+BASE = "https://rovmeta.com"
 
-class ImgExtractor(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.imgs = []
-        self.skip = False
-    def handle_starttag(self, tag, attrs):
-        if tag in ['script','style']: self.skip = True
-        if tag == 'img':
-            d = dict(attrs)
-            src = d.get('src','')
-            if 'cdn-webth' in src:
-                self.imgs.append((src, d.get('alt',''), d.get('width',''), d.get('height','')))
-    def handle_endtag(self, tag):
-        if tag in ['script','style']: self.skip = False
+def http_get(url, timeout=15):
+    req = request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "text/html,*/*;q=0.8",
+        "Accept-Encoding": "gzip",
+    })
+    with request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+        if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+            data = gzip.decompress(data)
+        return r.status, data
 
+def download_img(url, dest: Path, timeout=15) -> bool:
+    try:
+        req = request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Referer": "https://rovmeta.com/",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+        })
+        with request.urlopen(req, timeout=timeout) as r:
+            data = r.read()
+        if len(data) < 1000:
+            return False
+        dest.write_bytes(data)
+        return True
+    except Exception:
+        return False
 
-def best_icon_url(html: str) -> str | None:
-    p = ImgExtractor()
-    p.feed(html)
-    # img CDN แรกสุดในหน้าคือรูปของ hero นั้นเสมอ
-    for src, alt, w, h in p.imgs:
-        if 'cdn-webth' in src:
+def find_portrait_url(html: str) -> str | None:
+    """หา URL portrait ของ hero นี้จาก alt text ภาษาไทย"""
+    # alt="[ชื่อไทย] portrait" — เป็นรูปของ hero หน้านั้นเอง
+    imgs = re.findall(r'<img[^>]+src="(https://cdn-webth[^"]+)"[^>]*alt="([^"]*)"', html)
+    for src, alt in imgs:
+        if 'portrait' in alt.lower():
             return src
     return None
 
+def find_any_own_icon(html: str, slug: str) -> str | None:
+    """
+    สำหรับ hero ที่ไม่มี portrait — หาจาก JSON-LD หรือ script __NEXT_DATA__
+    ซึ่งมีข้อมูล hero ของหน้านั้นโดยตรง
+    """
+    # ลอง __NEXT_DATA__ JSON
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            # traverse หา image URL
+            text = json.dumps(data)
+            # หา CDN URL ที่น่าจะเป็นรูปของ hero นั้น
+            urls = re.findall(r'https://cdn-webth\.garenanow\.com[^"\'\\]+\.(?:jpg|jpeg|png|webp)', text)
+            # กรองเอาแค่ URL ที่ไม่ใช่ hero icon ของตัวอื่น (hero icon มักเล็กกว่า portrait)
+            for url in urls:
+                if 'portrait' in url.lower() or 'hero_icon' not in url.lower():
+                    return url
+        except Exception:
+            pass
+    
+    # ลอง structured data JSON-LD
+    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            data = json.loads(m.group(1))
+            img = data.get('image') or data.get('thumbnailUrl')
+            if img and 'cdn-webth' in img:
+                return img
+        except Exception:
+            pass
+    
+    return None
 
 def main():
     html_dir  = Path('out/rovmeta_raw')
     icons_dir = Path('out/icons')
     icons_dir.mkdir(parents=True, exist_ok=True)
 
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36',
-        'Referer': 'https://rovmeta.com/',
-        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-    })
+    # สร้าง slug list จาก HTML ที่มี
+    slugs = sorted([f.stem for f in html_dir.glob('*.html') if not f.name.startswith('_')])
+    print(f"Heroes to process: {len(slugs)}")
 
-    results = {}
-    ok = fail = skip = 0
+    ok = fail = skip = refetch = 0
 
-    for html_file in sorted(html_dir.glob('*.html')):
-        if html_file.name.startswith('_'): continue
-        slug = html_file.stem
+    for slug in slugs:
         dest = icons_dir / f'{slug}.jpg'
 
-        html = html_file.read_text(encoding='utf-8', errors='ignore')
-        url = best_icon_url(html)
-
-        if not url:
-            print(f'  NO URL  {slug}')
-            fail += 1
-            continue
-
-        if dest.exists() and dest.stat().st_size > 2000:
-            print(f'  cached  {slug}')
-            results[slug] = url
+        # ถ้ามีแล้วและขนาดสมเหตุสมผล → skip
+        if dest.exists() and dest.stat().st_size > 5000:
             skip += 1
             continue
 
-        try:
-            r = session.get(url, timeout=12)
-            if r.status_code == 200 and len(r.content) > 1000:
-                dest.write_bytes(r.content)
-                results[slug] = url
-                print(f'  ok      {slug}  ({len(r.content)//1024}KB)')
-                ok += 1
-            else:
-                print(f'  HTTP {r.status_code}  {slug}')
-                fail += 1
-        except Exception as e:
-            print(f'  ERROR   {slug}: {e}')
+        # อ่าน HTML ที่มีอยู่
+        html_file = html_dir / f'{slug}.html'
+        html = html_file.read_text(encoding='utf-8', errors='ignore')
+
+        # ลองหา portrait URL
+        url = find_portrait_url(html)
+
+        # ถ้าไม่มี portrait → fetch หน้าใหม่จาก rovmeta
+        if not url:
+            try:
+                _, fresh = http_get(f"{BASE}/th/heroes/{slug}")
+                fresh_html = fresh.decode('utf-8', errors='ignore')
+                url = find_portrait_url(fresh_html)
+                if not url:
+                    url = find_any_own_icon(fresh_html, slug)
+                # บันทึก HTML ใหม่ทับ
+                if url:
+                    html_file.write_bytes(fresh)
+                refetch += 1
+                time.sleep(1.5 + random.uniform(0, 0.5))
+            except Exception as e:
+                print(f"  REFETCH FAIL  {slug}: {e}")
+
+        if not url:
+            print(f"  NO URL        {slug}")
+            fail += 1
+            continue
+
+        # download รูป
+        if download_img(url, dest):
+            print(f"  ok  {slug:25}  ({dest.stat().st_size//1024}KB)")
+            ok += 1
+        else:
+            print(f"  DOWNLOAD FAIL {slug}  {url[-50:]}")
             fail += 1
 
-        time.sleep(0.25)  # ไม่ spam server
+        time.sleep(0.3)
 
-    # บันทึก icon_map.json สำหรับ parse_heroes.py
-    icon_map_path = Path('out/icon_map.json')
-    with open(icon_map_path, 'w') as f:
-        json.dump(results, f, indent=1)
-
-    print(f'\n✅ ok={ok}  skip={skip}  fail={fail}')
+    print(f'\n✅ ok={ok}  skip={skip}  refetch={refetch}  fail={fail}')
     print(f'   icons → {icons_dir}  ({len(list(icons_dir.glob("*.jpg")))} files)')
-
 
 if __name__ == '__main__':
     main()
